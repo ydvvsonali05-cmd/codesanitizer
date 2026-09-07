@@ -1,0 +1,1661 @@
+import ast
+import asyncio
+import hashlib
+import json
+import re
+import sys
+from dataclasses import dataclass, asdict
+from difflib import SequenceMatcher
+from datetime import datetime, timezone
+
+import httpx
+import pandas as pd
+import streamlit as st
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+APP_NAME = "CodeSanitizer Pro"
+APP_VERSION = "2.0"
+
+PYPI_API = "https://pypi.org/pypi/{}/json"
+OSV_API = "https://api.osv.dev/v1/query"
+
+SEVERITY_WEIGHT = {
+    "CRITICAL": 18,
+    "HIGH": 10,
+    "MEDIUM": 5,
+    "LOW": 2,
+    "INFO": 0,
+}
+
+# Common import -> PyPI distribution mappings
+IMPORT_TO_PACKAGE = {
+    "cv2": "opencv-python",
+    "PIL": "Pillow",
+    "sklearn": "scikit-learn",
+    "bs4": "beautifulsoup4",
+    "yaml": "PyYAML",
+    "dotenv": "python-dotenv",
+}
+
+POPULAR_PACKAGES = {
+    "requests",
+    "numpy",
+    "pandas",
+    "scipy",
+    "flask",
+    "django",
+    "fastapi",
+    "torch",
+    "tensorflow",
+    "scikit-learn",
+    "matplotlib",
+    "beautifulsoup4",
+    "pillow",
+    "cryptography",
+    "httpx",
+    "sqlalchemy",
+    "pytest",
+    "streamlit",
+    "opencv-python",
+    "pyyaml",
+    "python-dotenv",
+}
+
+
+# ============================================================
+# DATA MODELS
+# ============================================================
+
+@dataclass
+class Finding:
+    rule_id: str
+    severity: str
+    category: str
+    message: str
+    line: int
+    column: int
+    snippet: str
+    recommendation: str
+
+
+@dataclass
+class ImportInfo:
+    name: str
+    line: int
+    kind: str
+
+
+@dataclass
+class PackageResult:
+    import_name: str
+    package_name: str
+    exists: bool | None
+    status: str
+    version: str | None = None
+    summary: str = ""
+    project_url: str = ""
+    typo_score: int = 0
+    confusion_score: int = 0
+    risk_note: str = ""
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def normalize_package(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def get_line(source, line_number):
+    lines = source.splitlines()
+
+    if 1 <= line_number <= len(lines):
+        return lines[line_number - 1].strip()
+
+    return ""
+
+
+def get_function_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+
+    if isinstance(node, ast.Attribute):
+        parent = get_function_name(node.value)
+
+        if parent:
+            return f"{parent}.{node.attr}"
+
+        return node.attr
+
+    return ""
+
+
+def import_to_distribution(import_name):
+    return IMPORT_TO_PACKAGE.get(import_name, import_name)
+
+
+def typo_score(package_name):
+    """
+    Compare package name against popular package names.
+    Higher score = more similar.
+    """
+
+    name = normalize_package(package_name)
+
+    best_score = 0
+
+    for popular in POPULAR_PACKAGES:
+        score = SequenceMatcher(
+            None,
+            name,
+            normalize_package(popular)
+        ).ratio()
+
+        best_score = max(best_score, score)
+
+    return int(best_score * 100)
+
+
+def dependency_confusion_score(package_name):
+    """
+    Simple heuristic for dependency confusion / suspicious naming.
+    """
+
+    name = normalize_package(package_name)
+
+    if name in POPULAR_PACKAGES:
+        return 0
+
+    score = 0
+
+    for popular in POPULAR_PACKAGES:
+
+        if abs(len(name) - len(popular)) <= 2:
+
+            matching = sum(
+                a == b
+                for a, b in zip(name, popular)
+            )
+
+            similarity = (
+                matching /
+                max(len(name), len(popular), 1)
+            )
+
+            score = max(
+                score,
+                int(similarity * 100)
+            )
+
+    return score
+
+
+# ============================================================
+# AST SECURITY SCANNER
+# ============================================================
+
+class SecurityScanner(ast.NodeVisitor):
+
+    def __init__(self, source):
+
+        self.source = source
+
+        self.findings = []
+
+        self.imports = []
+
+    def add_finding(
+        self,
+        rule_id,
+        severity,
+        category,
+        message,
+        node,
+        recommendation
+    ):
+
+        line = getattr(node, "lineno", 0)
+
+        column = getattr(
+            node,
+            "col_offset",
+            0
+        )
+
+        self.findings.append(
+            Finding(
+                rule_id=rule_id,
+                severity=severity,
+                category=category,
+                message=message,
+                line=line,
+                column=column,
+                snippet=get_line(
+                    self.source,
+                    line
+                ),
+                recommendation=recommendation
+            )
+        )
+
+    # --------------------------------------------------------
+    # IMPORTS
+    # --------------------------------------------------------
+
+    def visit_Import(self, node):
+
+        for item in node.names:
+
+            package = item.name.split(".")[0]
+
+            self.imports.append(
+                ImportInfo(
+                    name=package,
+                    line=node.lineno,
+                    kind="import"
+                )
+            )
+
+        self.generic_visit(node)
+
+    def visit_ImportFrom(self, node):
+
+        if node.module:
+
+            package = node.module.split(".")[0]
+
+            self.imports.append(
+                ImportInfo(
+                    name=package,
+                    line=node.lineno,
+                    kind="from"
+                )
+            )
+
+        self.generic_visit(node)
+
+    # --------------------------------------------------------
+    # FUNCTION CALLS
+    # --------------------------------------------------------
+
+    def visit_Call(self, node):
+
+        name = get_function_name(node.func)
+
+        short_name = name.split(".")[-1]
+
+        # eval()
+        if short_name == "eval":
+
+            self.add_finding(
+                "CALL-EVAL",
+                "CRITICAL",
+                "Dynamic execution",
+                "eval() can execute attacker-controlled Python code.",
+                node,
+                "Replace eval() with json.loads(), ast.literal_eval(), or an explicit allow-list."
+            )
+
+        # exec()
+        if short_name == "exec":
+
+            self.add_finding(
+                "CALL-EXEC",
+                "CRITICAL",
+                "Dynamic execution",
+                "exec() executes dynamically supplied Python code.",
+                node,
+                "Remove dynamic execution and replace it with explicit application logic."
+            )
+
+        # compile()
+        if short_name == "compile":
+
+            self.add_finding(
+                "CALL-COMPILE",
+                "HIGH",
+                "Dynamic compilation",
+                "compile() can turn untrusted strings into executable Python.",
+                node,
+                "Do not compile untrusted input."
+            )
+
+        # __import__()
+        if short_name == "__import__":
+
+            self.add_finding(
+                "CALL-IMPORT",
+                "HIGH",
+                "Dynamic import",
+                "Dynamic imports can bypass normal dependency controls.",
+                node,
+                "Use explicit imports and an allow-list."
+            )
+
+        # os.system()
+        if name == "os.system":
+
+            self.add_finding(
+                "CMD-001",
+                "HIGH",
+                "Command execution",
+                "os.system() executes a shell command.",
+                node,
+                "Use subprocess.run() with a fixed executable and argument list."
+            )
+
+        # os.popen()
+        if name == "os.popen":
+
+            self.add_finding(
+                "CMD-001",
+                "HIGH",
+                "Command execution",
+                "os.popen() executes commands through the shell.",
+                node,
+                "Use subprocess.run([...], shell=False, check=True)."
+            )
+
+        # subprocess
+        if name.startswith("subprocess."):
+
+            for keyword in node.keywords:
+
+                if keyword.arg == "shell":
+
+                    if (
+                        isinstance(
+                            keyword.value,
+                            ast.Constant
+                        )
+                        and keyword.value.value is True
+                    ):
+
+                        self.add_finding(
+                            "CMD-002",
+                            "HIGH",
+                            "Command injection",
+                            "subprocess is called with shell=True.",
+                            node,
+                            "Set shell=False and pass arguments as a list."
+                        )
+
+        # pickle
+        if name in {
+            "pickle.load",
+            "pickle.loads",
+            "dill.load",
+            "dill.loads"
+        }:
+
+            self.add_finding(
+                "DESER-001",
+                "CRITICAL",
+                "Unsafe deserialization",
+                f"Unsafe deserialization detected through {name}().",
+                node,
+                "Never deserialize untrusted data with pickle/dill. Prefer JSON with schema validation."
+            )
+
+        # YAML
+        if name in {
+            "yaml.load",
+            "yaml.unsafe_load"
+        }:
+
+            self.add_finding(
+                "DESER-002",
+                "HIGH",
+                "Unsafe YAML",
+                f"Potentially unsafe YAML loader: {name}().",
+                node,
+                "Use yaml.safe_load() and validate the resulting schema."
+            )
+
+        # TLS
+        if name.startswith("requests.") or name.startswith("httpx."):
+
+            for keyword in node.keywords:
+
+                if keyword.arg == "verify":
+
+                    if (
+                        isinstance(
+                            keyword.value,
+                            ast.Constant
+                        )
+                        and keyword.value.value is False
+                    ):
+
+                        self.add_finding(
+                            "TLS-001",
+                            "HIGH",
+                            "TLS security",
+                            "TLS certificate verification is disabled.",
+                            node,
+                            "Keep TLS verification enabled and use a trusted CA bundle."
+                        )
+
+        self.generic_visit(node)
+
+
+# ============================================================
+# SECRET DETECTION
+# ============================================================
+
+SECRET_PATTERNS = [
+
+    (
+        "AWS access key",
+        r"\bAKIA[0-9A-Z]{16}\b"
+    ),
+
+    (
+        "GitHub token",
+        r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"
+    ),
+
+    (
+        "Private key",
+        r"-----BEGIN .*PRIVATE KEY-----"
+    ),
+
+    (
+        "Generic API key / secret",
+        r"(?i)\b(api[_-]?key|secret|password|passwd|token)\b\s*=\s*['\"][^'\"]{8,}['\"]"
+    ),
+
+]
+
+
+def detect_secrets(source):
+
+    findings = []
+
+    for label, pattern in SECRET_PATTERNS:
+
+        matches = re.finditer(
+            pattern,
+            source
+        )
+
+        for match in matches:
+
+            line = (
+                source.count(
+                    "\n",
+                    0,
+                    match.start()
+                )
+                + 1
+            )
+
+            findings.append(
+                Finding(
+                    rule_id="SECRET-001",
+                    severity="CRITICAL",
+                    category="Secret exposure",
+                    message=f"Possible {label} found in source code.",
+                    line=line,
+                    column=0,
+                    snippet=get_line(
+                        source,
+                        line
+                    ),
+                    recommendation="Move secrets to environment variables or a secret manager and rotate exposed credentials."
+                )
+            )
+
+    return findings
+
+
+# ============================================================
+# COMPLETE SOURCE SCAN
+# ============================================================
+
+def scan_source(source):
+
+    source_hash = hashlib.sha256(
+        source.encode()
+    ).hexdigest()
+
+    scanner = SecurityScanner(
+        source
+    )
+
+    syntax_error = None
+
+    try:
+
+        tree = ast.parse(
+            source
+        )
+
+        scanner.visit(tree)
+
+    except SyntaxError as error:
+
+        syntax_error = str(error)
+
+    findings = []
+
+    findings.extend(
+        scanner.findings
+    )
+
+    findings.extend(
+        detect_secrets(source)
+    )
+
+    if syntax_error:
+
+        findings.append(
+            Finding(
+                rule_id="SYNTAX-001",
+                severity="HIGH",
+                category="Syntax",
+                message=f"Python syntax error: {syntax_error}",
+                line=1,
+                column=0,
+                snippet="",
+                recommendation="Fix syntax errors before execution."
+            )
+        )
+
+    return {
+        "findings": findings,
+        "imports": scanner.imports,
+        "syntax_error": syntax_error,
+        "source_hash": source_hash
+    }
+
+
+# ============================================================
+# PYPI VERIFICATION
+# ============================================================
+
+async def check_pypi_package(
+    client,
+    import_name
+):
+
+    package_name = import_to_distribution(
+        import_name
+    )
+
+    url = PYPI_API.format(
+        package_name
+    )
+
+    try:
+
+        response = await client.get(
+            url
+        )
+
+        if response.status_code == 200:
+
+            data = response.json()
+
+            info = data.get(
+                "info",
+                {}
+            )
+
+            return PackageResult(
+
+                import_name=import_name,
+
+                package_name=package_name,
+
+                exists=True,
+
+                status="VERIFIED",
+
+                version=info.get(
+                    "version"
+                ),
+
+                summary=(
+                    info.get(
+                        "summary"
+                    )
+                    or ""
+                )[:250],
+
+                project_url=(
+                    info.get(
+                        "project_url"
+                    )
+                    or
+                    f"https://pypi.org/project/{package_name}/"
+                )
+            )
+
+        if response.status_code == 404:
+
+            return PackageResult(
+
+                import_name=import_name,
+
+                package_name=package_name,
+
+                exists=False,
+
+                status="NOT FOUND — POSSIBLE HALLUCINATION",
+
+                risk_note=(
+                    "This package does not currently exist on public PyPI."
+                )
+            )
+
+        return PackageResult(
+
+            import_name=import_name,
+
+            package_name=package_name,
+
+            exists=None,
+
+            status=f"UNVERIFIED ({response.status_code})"
+        )
+
+    except Exception as error:
+
+        return PackageResult(
+
+            import_name=import_name,
+
+            package_name=package_name,
+
+            exists=None,
+
+            status="NETWORK ERROR",
+
+            risk_note=str(error)
+        )
+
+
+async def verify_packages_async(
+    imports
+):
+
+    stdlib = set(
+        getattr(
+            sys,
+            "stdlib_module_names",
+            set()
+        )
+    )
+
+    unique_imports = []
+
+    seen = set()
+
+    for item in imports:
+
+        name = item.name.split(".")[0]
+
+        if (
+            name not in stdlib
+            and name != "__future__"
+            and name not in seen
+        ):
+
+            seen.add(name)
+
+            unique_imports.append(
+                name
+            )
+
+    async with httpx.AsyncClient(
+        timeout=10,
+        headers={
+            "User-Agent":
+                "CodeSanitizer-Pro/2.0"
+        }
+    ) as client:
+
+        tasks = [
+            check_pypi_package(
+                client,
+                package
+            )
+            for package in unique_imports
+        ]
+
+        return await asyncio.gather(
+            *tasks
+        )
+
+
+def verify_packages(imports):
+
+    return asyncio.run(
+        verify_packages_async(
+            imports
+        )
+    )
+
+
+# ============================================================
+# OSV VULNERABILITY CHECK
+# ============================================================
+
+async def check_osv_package(
+    client,
+    package
+):
+
+    if not package.exists:
+
+        return {
+            "package":
+                package.package_name,
+
+            "version":
+                package.version,
+
+            "advisories":
+                []
+        }
+
+    if not package.version:
+
+        return {
+            "package":
+                package.package_name,
+
+            "version":
+                None,
+
+            "advisories":
+                []
+        }
+
+    payload = {
+
+        "package": {
+            "name":
+                package.package_name,
+
+            "ecosystem":
+                "PyPI"
+        },
+
+        "version":
+            package.version
+    }
+
+    try:
+
+        response = await client.post(
+            OSV_API,
+            json=payload
+        )
+
+        if response.status_code != 200:
+
+            return {
+                "package":
+                    package.package_name,
+
+                "version":
+                    package.version,
+
+                "advisories":
+                    []
+            }
+
+        data = response.json()
+
+        return {
+
+            "package":
+                package.package_name,
+
+            "version":
+                package.version,
+
+            "advisories":
+                data.get(
+                    "vulns",
+                    []
+                )
+        }
+
+    except Exception:
+
+        return {
+
+            "package":
+                package.package_name,
+
+            "version":
+                package.version,
+
+            "advisories":
+                []
+        }
+
+
+async def check_osv_async(
+    packages
+):
+
+    async with httpx.AsyncClient(
+        timeout=10
+    ) as client:
+
+        tasks = [
+            check_osv_package(
+                client,
+                package
+            )
+            for package in packages
+        ]
+
+        return await asyncio.gather(
+            *tasks
+        )
+
+
+def check_osv(packages):
+
+    return asyncio.run(
+        check_osv_async(
+            packages
+        )
+    )
+
+
+# ============================================================
+# RISK ANALYSIS
+# ============================================================
+
+def calculate_risk(
+    findings,
+    packages
+):
+
+    score = 0
+
+    for finding in findings:
+
+        score += SEVERITY_WEIGHT.get(
+            finding.severity,
+            0
+        )
+
+    for package in packages:
+
+        if package.exists is False:
+
+            score += 18
+
+        elif package.typo_score >= 90:
+
+            score += 8
+
+    return min(
+        score,
+        100
+    )
+
+
+def security_gate(
+    risk_score,
+    packages
+):
+
+    hallucinated = sum(
+        package.exists is False
+        for package in packages
+    )
+
+    return (
+        risk_score <= 20
+        and hallucinated == 0
+    )
+
+
+# ============================================================
+# REPORT GENERATION
+# ============================================================
+
+def create_json_report(
+    result,
+    packages,
+    osv_results,
+    risk_score
+):
+
+    return json.dumps(
+        {
+            "application":
+                APP_NAME,
+
+            "version":
+                APP_VERSION,
+
+            "generated_at":
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
+
+            "risk_score":
+                risk_score,
+
+            "security_gate":
+                security_gate(
+                    risk_score,
+                    packages
+                ),
+
+            "findings":
+                [
+                    asdict(f)
+                    for f in result[
+                        "findings"
+                    ]
+                ],
+
+            "packages":
+                [
+                    asdict(p)
+                    for p in packages
+                ],
+
+            "osv":
+                osv_results
+        },
+        indent=2
+    )
+
+
+def create_markdown_report(
+    result,
+    packages,
+    osv_results,
+    risk_score
+):
+
+    lines = []
+
+    lines.append(
+        "# CodeSanitizer Pro Security Report"
+    )
+
+    lines.append("")
+
+    lines.append(
+        f"Risk Score: **{risk_score}/100**"
+    )
+
+    lines.append("")
+
+    lines.append(
+        "## Security Gate"
+    )
+
+    lines.append("")
+
+    if security_gate(
+        risk_score,
+        packages
+    ):
+
+        lines.append(
+            "✅ PASS"
+        )
+
+    else:
+
+        lines.append(
+            "❌ BLOCKED"
+        )
+
+    lines.append("")
+
+    lines.append(
+        "## Findings"
+    )
+
+    lines.append("")
+
+    for finding in result[
+        "findings"
+    ]:
+
+        lines.append(
+            f"### {finding.severity} — {finding.rule_id}"
+        )
+
+        lines.append(
+            f"- Category: {finding.category}"
+        )
+
+        lines.append(
+            f"- Line: {finding.line}"
+        )
+
+        lines.append(
+            f"- Finding: {finding.message}"
+        )
+
+        lines.append(
+            f"- Fix: {finding.recommendation}"
+        )
+
+        lines.append("")
+
+    lines.append(
+        "## Package Verification"
+    )
+
+    lines.append("")
+
+    for package in packages:
+
+        lines.append(
+            f"- **{package.import_name}** → "
+            f"{package.package_name}: "
+            f"**{package.status}**"
+        )
+
+    lines.append("")
+
+    lines.append(
+        "## OSV Vulnerabilities"
+    )
+
+    lines.append("")
+
+    for item in osv_results:
+
+        lines.append(
+            f"- {item['package']} "
+            f"{item['version']}: "
+            f"{len(item['advisories'])} advisory(s)"
+        )
+
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
+# DEMO CODE
+# ============================================================
+
+SAMPLE_CODE = r'''
+import os
+import requests
+import subprocess
+import hallucinated_requests
+
+API_KEY = "sk_live_example_secret_123456"
+
+user_code = eval(user_input)
+
+os.system("curl " + user_input)
+
+subprocess.run(
+    user_input,
+    shell=True
+)
+
+requests.get(
+    "https://example.com",
+    verify=False
+)
+'''
+
+
+# ============================================================
+# STREAMLIT UI
+# ============================================================
+
+st.set_page_config(
+    page_title=APP_NAME,
+    page_icon="🛡️",
+    layout="wide"
+)
+
+st.title(
+    "🛡️ CodeSanitizer Pro"
+)
+
+st.subheader(
+    "AI-Generated Code & Package Hallucination Auditor"
+)
+
+st.caption(
+    "AST Security • PyPI Verification • Supply Chain • OSV • DevSecOps"
+)
+
+st.divider()
+
+
+# ------------------------------------------------------------
+# SIDEBAR
+# ------------------------------------------------------------
+
+with st.sidebar:
+
+    st.header(
+        "⚙️ Scan Settings"
+    )
+
+    enable_pypi = st.checkbox(
+        "Live PyPI verification",
+        value=True
+    )
+
+    enable_osv = st.checkbox(
+        "OSV vulnerability checking",
+        value=True
+    )
+
+    st.divider()
+
+    st.info(
+        """
+        CodeSanitizer never executes
+        submitted Python code.
+
+        It only parses and analyzes
+        the source statically.
+        """
+    )
+
+
+# ------------------------------------------------------------
+# INPUT
+# ------------------------------------------------------------
+
+left, right = st.columns(
+    [1.3, 1]
+)
+
+with left:
+
+    uploaded_file = st.file_uploader(
+        "Upload Python file",
+        type=["py"]
+    )
+
+    if uploaded_file:
+
+        source_code = (
+            uploaded_file
+            .getvalue()
+            .decode(
+                "utf-8",
+                errors="replace"
+            )
+        )
+
+    else:
+
+        source_code = st.text_area(
+            "Paste AI-generated Python code",
+            value=SAMPLE_CODE,
+            height=450
+        )
+
+    scan_button = st.button(
+        "🔎 Run Complete Security Audit",
+        type="primary",
+        use_container_width=True
+    )
+
+
+# ------------------------------------------------------------
+# INTRO
+# ------------------------------------------------------------
+
+with right:
+
+    st.markdown(
+        """
+### What CodeSanitizer checks
+
+**Code Security**
+- `eval()`
+- `exec()`
+- `os.system()`
+- `shell=True`
+- unsafe deserialization
+- disabled TLS
+- hardcoded secrets
+
+**Supply Chain**
+- nonexistent PyPI packages
+- package hallucinations
+- typosquatting
+- dependency confusion signals
+
+**Threat Intelligence**
+- OSV vulnerability lookup
+
+**DevSecOps**
+- risk score
+- security gate
+- downloadable reports
+"""
+    )
+
+
+# ============================================================
+# RUN AUDIT
+# ============================================================
+
+if scan_button:
+
+    with st.spinner(
+        "Analyzing source code..."
+    ):
+
+        result = scan_source(
+            source_code
+        )
+
+        packages = []
+
+        if enable_pypi:
+
+            packages = verify_packages(
+                result["imports"]
+            )
+
+        # Add supply-chain signals
+        for package in packages:
+
+            if package.exists is False:
+
+                package.typo_score = (
+                    typo_score(
+                        package.package_name
+                    )
+                )
+
+                package.confusion_score = (
+                    dependency_confusion_score(
+                        package.package_name
+                    )
+                )
+
+                if package.typo_score >= 80:
+
+                    package.risk_note = (
+                        "Name is highly similar "
+                        "to a known popular package. "
+                        "Investigate typosquatting or "
+                        "dependency confusion."
+                    )
+
+        osv_results = []
+
+        if enable_osv and packages:
+
+            osv_results = check_osv(
+                packages
+            )
+
+        risk_score = calculate_risk(
+            result["findings"],
+            packages
+        )
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    st.divider()
+
+    st.header(
+        "📊 Security Overview"
+    )
+
+    col1, col2, col3, col4, col5 = st.columns(
+        5
+    )
+
+    critical_count = sum(
+        f.severity == "CRITICAL"
+        for f in result["findings"]
+    )
+
+    high_count = sum(
+        f.severity == "HIGH"
+        for f in result["findings"]
+    )
+
+    hallucinated_count = sum(
+        p.exists is False
+        for p in packages
+    )
+
+    osv_count = sum(
+        len(x["advisories"])
+        for x in osv_results
+    )
+
+    col1.metric(
+        "Risk Score",
+        f"{risk_score}/100"
+    )
+
+    col2.metric(
+        "Critical",
+        critical_count
+    )
+
+    col3.metric(
+        "High",
+        high_count
+    )
+
+    col4.metric(
+        "Hallucinated Packages",
+        hallucinated_count
+    )
+
+    col5.metric(
+        "OSV Advisories",
+        osv_count
+    )
+
+
+    # ========================================================
+    # SECURITY GATE
+    # ========================================================
+
+    if security_gate(
+        risk_score,
+        packages
+    ):
+
+        st.success(
+            "✅ SECURITY GATE PASSED — "
+            "No blocking issue detected."
+        )
+
+    else:
+
+        st.error(
+            "❌ SECURITY GATE BLOCKED — "
+            "Fix the reported security issues "
+            "before production."
+        )
+
+
+    # ========================================================
+    # TABS
+    # ========================================================
+
+    findings_tab, packages_tab, osv_tab, reports_tab = st.tabs(
+        [
+            "🚨 Findings",
+            "📦 Dependencies",
+            "🔍 OSV",
+            "📄 Reports"
+        ]
+    )
+
+
+    # ========================================================
+    # FINDINGS
+    # ========================================================
+
+    with findings_tab:
+
+        if not result["findings"]:
+
+            st.success(
+                "No configured security findings."
+            )
+
+        else:
+
+            table = []
+
+            for finding in result[
+                "findings"
+            ]:
+
+                table.append(
+                    {
+                        "Severity":
+                            finding.severity,
+
+                        "Rule":
+                            finding.rule_id,
+
+                        "Line":
+                            finding.line,
+
+                        "Category":
+                            finding.category,
+
+                        "Finding":
+                            finding.message
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(table),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            st.subheader(
+                "Recommended Fixes"
+            )
+
+            for finding in result[
+                "findings"
+            ]:
+
+                with st.expander(
+                    f"{finding.severity} | "
+                    f"{finding.rule_id} | "
+                    f"Line {finding.line}"
+                ):
+
+                    st.code(
+                        finding.snippet,
+                        language="python"
+                    )
+
+                    st.write(
+                        finding.message
+                    )
+
+                    st.info(
+                        "💡 "
+                        + finding.recommendation
+                    )
+
+
+    # ========================================================
+    # PACKAGES
+    # ========================================================
+
+    with packages_tab:
+
+        if not packages:
+
+            st.info(
+                "No third-party packages detected."
+            )
+
+        else:
+
+            table = []
+
+            for package in packages:
+
+                table.append(
+                    {
+                        "Import":
+                            package.import_name,
+
+                        "Distribution":
+                            package.package_name,
+
+                        "Status":
+                            package.status,
+
+                        "Version":
+                            package.version
+                            or "—",
+
+                        "Typosquat":
+                            package.typo_score,
+
+                        "Confusion":
+                            package.confusion_score,
+
+                        "Risk":
+                            package.risk_note
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(table),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            for package in packages:
+
+                if package.exists is False:
+
+                    st.error(
+                        f"🚨 {package.package_name} "
+                        f"was NOT found on PyPI."
+                    )
+
+                    if package.typo_score >= 80:
+
+                        st.warning(
+                            "⚠️ This name is "
+                            "similar to a popular "
+                            "package. Investigate "
+                            "typosquatting."
+                        )
+
+
+    # ========================================================
+    # OSV
+    # ========================================================
+
+    with osv_tab:
+
+        if not osv_results:
+
+            st.info(
+                "No OSV vulnerability results."
+            )
+
+        else:
+
+            osv_table = []
+
+            for item in osv_results:
+
+                osv_table.append(
+                    {
+                        "Package":
+                            item["package"],
+
+                        "Version":
+                            item["version"],
+
+                        "Advisories":
+                            len(
+                                item[
+                                    "advisories"
+                                ]
+                            )
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    osv_table
+                ),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            for item in osv_results:
+
+                for advisory in item[
+                    "advisories"
+                ]:
+
+                    st.warning(
+                        f"⚠️ "
+                        f"{advisory.get('id', 'OSV')}: "
+                        f"{advisory.get('summary', '')}"
+                    )
+
+
+    # ========================================================
+    # REPORTS
+    # ========================================================
+
+    with reports_tab:
+
+        markdown_report = create_markdown_report(
+            result,
+            packages,
+            osv_results,
+            risk_score
+        )
+
+        json_report = create_json_report(
+            result,
+            packages,
+            osv_results,
+            risk_score
+        )
+
+        st.download_button(
+            "📋 Download Markdown Report",
+            markdown_report,
+            "codesanitizer_report.md",
+            "text/markdown"
+        )
+
+        st.download_button(
+            "📦 Download JSON Report",
+            json_report,
+            "codesanitizer_report.json",
+            "application/json"
+        )
+
+        st.markdown(
+            markdown_report
+        )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "CodeSanitizer Pro 2.0 • "
+    "Static analysis only • "
+    "Never executes submitted source code"
+)
